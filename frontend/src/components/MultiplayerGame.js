@@ -1,9 +1,11 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
+import { useAccount } from 'wagmi';
 import io from 'socket.io-client';
 import '../styles/Game.css';
 import { BACKEND_URL, INITIAL_RATING } from '../constants';
 import soundManager from '../utils/soundManager';
+import { useStakeAsPlayer2 } from '../hooks/useContract';
 
 const MultiplayerGame = ({ username }) => {
   const canvasRef = useRef(null);
@@ -24,11 +26,33 @@ const MultiplayerGame = ({ username }) => {
   const [pausesRemaining, setPausesRemaining] = useState(2);
   const [showRematchRequest, setShowRematchRequest] = useState(false);
   const [rematchRequester, setRematchRequester] = useState(null);
+  const [showPlayer2StakingModal, setShowPlayer2StakingModal] = useState(false);
+  const [stakingData, setStakingData] = useState(null);
+  const [isPlayer2Staking, setIsPlayer2Staking] = useState(false);
+  const [stakingErrorMessage, setStakingErrorMessage] = useState(null);
+  const [isCursorHidden, setIsCursorHidden] = useState(false);
   const navigate = useNavigate();
   const location = useLocation();
   const containerRef = useRef(null);
   const prevGameDataRef = useRef(null);
   const isMounted = useRef(false);
+  const cursorTimeoutRef = useRef(null);
+
+  // Keyboard control state
+  const [keyboardPaddleY, setKeyboardPaddleY] = useState(0);
+  const keysPressed = useRef({ ArrowUp: false, ArrowDown: false });
+  const keyboardIntervalRef = useRef(null);
+
+  // Web3 hooks
+  const { address, isConnected } = useAccount();
+  const {
+    stakeAsPlayer2,
+    hash: player2StakingTxHash,
+    isPending: isPlayer2StakingPending,
+    isConfirming: isPlayer2StakingConfirming,
+    isSuccess: isPlayer2StakingSuccess,
+    error: player2StakingError
+  } = useStakeAsPlayer2();
 
   const gameMode = location.state?.gameMode || 'quick';
   const joinRoomCode = location.state?.roomCode;
@@ -73,7 +97,26 @@ const MultiplayerGame = ({ username }) => {
     ctx.fill();
   }, [gameData, isWaiting, roomCode]);
 
+  // Cursor auto-hide management
+  const resetCursorTimeout = useCallback(() => {
+    // Clear existing timeout
+    if (cursorTimeoutRef.current) {
+      clearTimeout(cursorTimeoutRef.current);
+    }
+
+    // Show cursor
+    setIsCursorHidden(false);
+
+    // Set new timeout to hide cursor after 3 seconds
+    cursorTimeoutRef.current = setTimeout(() => {
+      setIsCursorHidden(true);
+    }, 3000);
+  }, []);
+
   const handleMouseMove = useCallback((e) => {
+    // Reset cursor timeout on mouse move
+    resetCursorTimeout();
+
     if (!socketRef.current || isWaiting) return;
 
     const container = containerRef.current;
@@ -84,7 +127,7 @@ const MultiplayerGame = ({ username }) => {
     const clampedY = Math.max(-1, Math.min(1, relativeY));
 
     socketRef.current.emit('paddleMove', { position: clampedY });
-  }, [isWaiting]);
+  }, [isWaiting, resetCursorTimeout]);
 
   const handleTouchMove = useCallback((e) => {
     if (!socketRef.current || isWaiting) return;
@@ -104,6 +147,58 @@ const MultiplayerGame = ({ username }) => {
       socketRef.current.emit('paddleMove', { position: clampedY });
     }
   }, [isWaiting]);
+
+  // Keyboard controls
+  const handleKeyDown = useCallback((e) => {
+    if (isWaiting || !socketRef.current) return;
+
+    if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+      e.preventDefault(); // Prevent page scrolling
+      keysPressed.current[e.key] = true;
+
+      // Start keyboard movement if not already running
+      if (!keyboardIntervalRef.current) {
+        keyboardIntervalRef.current = setInterval(() => {
+          setKeyboardPaddleY((prevY) => {
+            const MOVE_SPEED = 0.05; // Adjust speed as needed
+            let newY = prevY;
+
+            if (keysPressed.current.ArrowUp) {
+              newY -= MOVE_SPEED;
+            }
+            if (keysPressed.current.ArrowDown) {
+              newY += MOVE_SPEED;
+            }
+
+            // Clamp position between -1 and 1
+            newY = Math.max(-1, Math.min(1, newY));
+
+            // Emit paddle position to server
+            if (socketRef.current) {
+              socketRef.current.emit('paddleMove', { position: newY });
+            }
+
+            return newY;
+          });
+        }, 16); // ~60fps
+      }
+    }
+  }, [isWaiting]);
+
+  const handleKeyUp = useCallback((e) => {
+    if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+      e.preventDefault();
+      keysPressed.current[e.key] = false;
+
+      // Stop keyboard movement if no keys are pressed
+      if (!keysPressed.current.ArrowUp && !keysPressed.current.ArrowDown) {
+        if (keyboardIntervalRef.current) {
+          clearInterval(keyboardIntervalRef.current);
+          keyboardIntervalRef.current = null;
+        }
+      }
+    }
+  }, []);
 
   const handlePauseGame = useCallback(() => {
     if (socketRef.current && !isPaused) {
@@ -127,6 +222,96 @@ const MultiplayerGame = ({ username }) => {
     }
   }, []);
 
+  const handlePlayer2Stake = useCallback(async () => {
+    if (!isConnected) {
+      alert('Please connect your wallet first');
+      return;
+    }
+
+    if (!stakingData) {
+      alert('No staking data available');
+      return;
+    }
+
+    console.log('💎 Player2 initiating stake:', stakingData);
+    setStakingErrorMessage(null); // Clear any previous errors
+    setIsPlayer2Staking(true);
+
+    try {
+      await stakeAsPlayer2(stakingData.roomCode, stakingData.stakeAmount);
+    } catch (error) {
+      console.error('Error initiating Player2 stake:', error);
+      setIsPlayer2Staking(false);
+    }
+  }, [isConnected, stakingData, stakeAsPlayer2]);
+
+  // Handle successful Player2 staking transaction
+  useEffect(() => {
+    console.log('🔍 Player2 Staking useEffect:', {
+      isPlayer2StakingSuccess,
+      player2StakingTxHash,
+      stakingData,
+      address
+    });
+
+    if (isPlayer2StakingSuccess && player2StakingTxHash && stakingData) {
+      console.log('✅ Player2 staking successful! Updating game record...');
+
+      // Update backend with Player2's transaction
+      fetch(`${BACKEND_URL}/games`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          roomCode: stakingData.roomCode,
+          player2: { name: username, rating: 800 },
+          player2Address: address,
+          player2TxHash: player2StakingTxHash,
+          status: 'ready'
+        })
+      })
+        .then(res => res.json())
+        .then(data => {
+          console.log('✅ Game record updated with Player2 stake:', data);
+        })
+        .catch(err => {
+          console.error('❌ Failed to update game record:', err);
+        });
+
+      // Notify backend that Player2 has completed staking
+      if (socketRef.current) {
+        socketRef.current.emit('player2StakeCompleted', {
+          roomCode: stakingData.roomCode
+        });
+      }
+
+      setIsPlayer2Staking(false);
+      setShowPlayer2StakingModal(false);
+      setStakingData(null);
+    }
+  }, [isPlayer2StakingSuccess, player2StakingTxHash, stakingData, username, address]);
+
+  // Handle Player2 staking errors
+  useEffect(() => {
+    if (player2StakingError) {
+      console.error('Player2 staking error:', player2StakingError);
+      setIsPlayer2Staking(false);
+
+      // Extract a user-friendly error message
+      let errorMsg = 'Transaction failed. Please try again.';
+      if (player2StakingError.message) {
+        if (player2StakingError.message.includes('User rejected')) {
+          errorMsg = 'Transaction was rejected. Please try again when ready.';
+        } else if (player2StakingError.message.includes('insufficient funds')) {
+          errorMsg = 'Insufficient funds in your wallet.';
+        } else {
+          errorMsg = player2StakingError.message;
+        }
+      }
+
+      setStakingErrorMessage(errorMsg);
+    }
+  }, [player2StakingError]);
+
   const setupSocket = useCallback(() => {
     if (!isMounted.current || !username) return;
 
@@ -148,8 +333,9 @@ const MultiplayerGame = ({ username }) => {
         socketId: socket.id
       };
 
-      if (gameMode === 'create') {
-        socket.emit('createRoom', playerData);
+      if (gameMode === 'create' || gameMode === 'create-staked') {
+        const specificRoomCode = location.state?.roomCode;
+        socket.emit('createRoom', playerData, specificRoomCode);
       } else if (gameMode === 'join' && joinRoomCode) {
         socket.emit('joinRoom', { roomCode: joinRoomCode, player: playerData });
       } else {
@@ -172,6 +358,18 @@ const MultiplayerGame = ({ username }) => {
     socket.on('roomReady', (data) => {
       console.log('Room ready:', data);
       setIsWaiting(true);
+    });
+
+    socket.on('stakedMatchJoined', (data) => {
+      console.log('💎 Staked match joined! Player2 needs to stake:', data);
+      setStakingData(data);
+      setShowPlayer2StakingModal(true);
+    });
+
+    socket.on('waitingForPlayer2Stake', (data) => {
+      console.log('⏳ Waiting for Player2 to stake:', data);
+      setIsWaiting(true);
+      // Update the waiting message to indicate we're waiting for Player2 to stake
     });
 
     socket.on('gameStart', (data) => {
@@ -340,6 +538,44 @@ const MultiplayerGame = ({ username }) => {
     };
   }, [handleMouseMove, handleTouchMove]);
 
+  // Keyboard event listeners
+  useEffect(() => {
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+
+      // Cleanup keyboard interval on unmount
+      if (keyboardIntervalRef.current) {
+        clearInterval(keyboardIntervalRef.current);
+        keyboardIntervalRef.current = null;
+      }
+    };
+  }, [handleKeyDown, handleKeyUp]);
+
+  // Apply cursor-hidden class when cursor should be hidden
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    if (isCursorHidden) {
+      container.classList.add('cursor-hidden');
+    } else {
+      container.classList.remove('cursor-hidden');
+    }
+  }, [isCursorHidden]);
+
+  // Cleanup cursor timeout on unmount
+  useEffect(() => {
+    return () => {
+      if (cursorTimeoutRef.current) {
+        clearTimeout(cursorTimeoutRef.current);
+      }
+    };
+  }, []);
+
   const handleLeaveGame = useCallback(() => {
     if (window.confirm('Are you sure you want to leave? You will forfeit the game.')) {
       if (socketRef.current) {
@@ -373,21 +609,37 @@ const MultiplayerGame = ({ username }) => {
       </div>
 
       {!isWaiting && (
-        <div className="game-controls">
-          <button
-            onClick={handlePauseGame}
-            disabled={isPaused || pausesRemaining <= 0}
-            className="control-btn pause-btn"
-          >
-            Pause ({pausesRemaining})
-          </button>
-          <button
-            onClick={handleForfeitGame}
-            className="control-btn forfeit-btn"
-          >
-            Forfeit
-          </button>
-        </div>
+        <>
+          <div className="controls-hint" style={{
+            position: 'absolute',
+            top: '10px',
+            right: '10px',
+            fontSize: '12px',
+            color: 'rgba(255, 255, 255, 0.6)',
+            fontFamily: 'monospace',
+            textAlign: 'right',
+            lineHeight: '1.4'
+          }}>
+            <div>🎮 Controls:</div>
+            <div>↑↓ Arrow Keys</div>
+            <div>or Mouse</div>
+          </div>
+          <div className="game-controls">
+            <button
+              onClick={handlePauseGame}
+              disabled={isPaused || pausesRemaining <= 0}
+              className="control-btn pause-btn"
+            >
+              Pause ({pausesRemaining})
+            </button>
+            <button
+              onClick={handleForfeitGame}
+              className="control-btn forfeit-btn"
+            >
+              Forfeit
+            </button>
+          </div>
+        </>
       )}
 
       {isPaused && (
@@ -419,6 +671,100 @@ const MultiplayerGame = ({ username }) => {
                 Decline
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {showPlayer2StakingModal && stakingData && (
+        <div className="transaction-overlay">
+          <div className="transaction-modal">
+            <h2>💎 Staked Match</h2>
+            <p style={{ marginBottom: '20px' }}>
+              This is a staked match. You need to stake {stakingData.stakeAmount} ETH to join.
+            </p>
+
+            {/* Error State */}
+            {stakingErrorMessage && !isPlayer2Staking ? (
+              <>
+                <div style={{
+                  backgroundColor: '#ff4444',
+                  color: 'white',
+                  padding: '15px',
+                  borderRadius: '8px',
+                  marginBottom: '20px',
+                  fontSize: '14px'
+                }}>
+                  ❌ {stakingErrorMessage}
+                </div>
+                <p style={{ fontSize: '14px', color: '#888', marginBottom: '20px' }}>
+                  {isConnected
+                    ? `Your wallet: ${address?.slice(0, 6)}...${address?.slice(-4)}`
+                    : 'Please connect your wallet first'}
+                </p>
+                <div className="rematch-buttons">
+                  <button
+                    onClick={handlePlayer2Stake}
+                    className="accept-btn"
+                    disabled={!isConnected}
+                  >
+                    Retry Staking
+                  </button>
+                  <button
+                    onClick={() => {
+                      setShowPlayer2StakingModal(false);
+                      setStakingData(null);
+                      setStakingErrorMessage(null);
+                      navigate('/');
+                    }}
+                    className="decline-btn"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </>
+            ) : !isPlayer2Staking ? (
+              /* Initial State */
+              <>
+                <p style={{ fontSize: '14px', color: '#888', marginBottom: '20px' }}>
+                  {isConnected
+                    ? `Your wallet: ${address?.slice(0, 6)}...${address?.slice(-4)}`
+                    : 'Please connect your wallet first'}
+                </p>
+                <div className="rematch-buttons">
+                  <button
+                    onClick={handlePlayer2Stake}
+                    className="accept-btn"
+                    disabled={!isConnected}
+                  >
+                    Stake & Play
+                  </button>
+                  <button
+                    onClick={() => {
+                      setShowPlayer2StakingModal(false);
+                      setStakingData(null);
+                      setStakingErrorMessage(null);
+                      navigate('/');
+                    }}
+                    className="decline-btn"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </>
+            ) : (
+              /* Loading State */
+              <>
+                <h3>
+                  {isPlayer2StakingPending && 'Confirm Transaction in Wallet...'}
+                  {isPlayer2StakingConfirming && 'Transaction Confirming...'}
+                </h3>
+                <div className="transaction-spinner"></div>
+                <p>
+                  {isPlayer2StakingPending && 'Please confirm the transaction in your wallet'}
+                  {isPlayer2StakingConfirming && 'Waiting for blockchain confirmation'}
+                </p>
+              </>
+            )}
           </div>
         </div>
       )}

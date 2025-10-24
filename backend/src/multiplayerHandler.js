@@ -1,6 +1,8 @@
 const RoomManager = require('./roomManager');
 const GameManager = require('./gameManager');
 const LeaderboardManager = require('./leaderboardManager');
+const Game = require('./models/Game');
+const signatureService = require('./services/signatureService');
 
 class MultiplayerHandler {
   constructor(io) {
@@ -18,8 +20,8 @@ class MultiplayerHandler {
   handleConnection(socket) {
     const username = socket.handshake.query.username;
 
-    socket.on('createRoom', (player) => {
-      this.handleCreateRoom(socket, player);
+    socket.on('createRoom', (player, roomCode) => {
+      this.handleCreateRoom(socket, player, roomCode);
     });
 
     socket.on('joinRoom', (data) => {
@@ -28,6 +30,10 @@ class MultiplayerHandler {
 
     socket.on('findRandomMatch', (player) => {
       this.handleFindRandomMatch(socket, player);
+    });
+
+    socket.on('player2StakeCompleted', (data) => {
+      this.handlePlayer2StakeCompleted(socket, data);
     });
 
     socket.on('spectateGame', (data) => {
@@ -83,15 +89,24 @@ class MultiplayerHandler {
     }
   }
 
-  handleCreateRoom(socket, player) {
+  handleCreateRoom(socket, player, providedRoomCode) {
     const existingRoom = this.roomManager.getRoomByPlayer(socket.id);
     if (existingRoom) {
       socket.emit('error', { message: 'Already in a room' });
       return;
     }
 
-    const roomCode = this.roomManager.createRoom(player, socket.id);
+    // Use provided room code for staked matches, or generate new one
+    const roomCode = providedRoomCode || this.roomManager.createRoom(player, socket.id);
+
+    // If room code was provided, create room with that specific code
+    if (providedRoomCode) {
+      this.roomManager.createRoomWithCode(roomCode, player, socket.id);
+    }
+
     socket.join(roomCode);
+
+    console.log(`Room created: ${roomCode} by ${player.name} (${socket.id})`);
 
     socket.emit('roomCreated', {
       roomCode,
@@ -99,9 +114,12 @@ class MultiplayerHandler {
     });
   }
 
-  handleJoinRoom(socket, { roomCode, player }) {
+  async handleJoinRoom(socket, { roomCode, player }) {
+    console.log(`🔵 handleJoinRoom called - Room: ${roomCode}, Player: ${player?.name}, Socket: ${socket.id}`);
+
     const existingRoom = this.roomManager.getRoomByPlayer(socket.id);
     if (existingRoom) {
+      console.log(`❌ Player ${socket.id} already in room ${existingRoom.code}`);
       socket.emit('error', { message: 'Already in a room' });
       return;
     }
@@ -109,15 +127,66 @@ class MultiplayerHandler {
     const result = this.roomManager.joinRoom(roomCode, player, socket.id);
 
     if (!result.success) {
+      console.log(`❌ Failed to join room ${roomCode}: ${result.error}`);
       socket.emit('error', { message: result.error });
       return;
     }
 
+    console.log(`✅ Player ${player?.name} joined room ${roomCode}`);
     socket.join(roomCode);
 
+    // Check if this is a staked match
+    try {
+      console.log(`📡 Checking for staked match in database: ${roomCode}`);
+      const gameRecord = await Game.findOne({ roomCode });
+
+      if (gameRecord) {
+        console.log(`📊 Game record:`, JSON.stringify(gameRecord, null, 2));
+
+        if (gameRecord.isStaked && !gameRecord.player2TxHash) {
+          // This is a staked match and Player 2 hasn't staked yet
+          console.log(`💎 Staked match detected! Prompting Player 2 to stake ${gameRecord.stakeAmount} ETH`);
+          socket.emit('stakedMatchJoined', {
+            roomCode,
+            stakeAmount: gameRecord.stakeAmount,
+            player1Address: gameRecord.player1Address
+          });
+
+          this.io.to(roomCode).emit('waitingForPlayer2Stake', {
+            stakeAmount: gameRecord.stakeAmount
+          });
+
+          console.log(`⏳ Waiting for Player 2 to stake...`);
+          return; // Don't start game yet
+        } else {
+          console.log(`ℹ️  Not a staked match or Player 2 already staked. isStaked: ${gameRecord.isStaked}, player2TxHash: ${gameRecord.player2TxHash}`);
+        }
+      } else {
+        console.log(`ℹ️  No game record found - proceeding with normal match`);
+      }
+    } catch (error) {
+      console.error('❌ Error checking for staked match:', error);
+      // Continue with normal game start if check fails
+    }
+
+    console.log(`🎮 Starting normal game for room ${roomCode}`);
     this.io.to(roomCode).emit('roomReady', {
       room: result.room
     });
+
+    this.startGame(roomCode);
+  }
+
+  handlePlayer2StakeCompleted(socket, { roomCode }) {
+    const room = this.roomManager.getRoom(roomCode);
+    if (!room) {
+      socket.emit('error', { message: 'Room not found' });
+      return;
+    }
+
+    console.log('Player 2 staking completed for room:', roomCode);
+
+    this.io.to(roomCode).emit('roomReady', { room });
 
     this.startGame(roomCode);
   }
@@ -198,6 +267,82 @@ class MultiplayerHandler {
       winner.name,
       loser.name
     );
+
+    // Save game result to database (both staked and casual games)
+    try {
+      // Determine which player won (player1 or player2)
+      const winnerRole = game.players[0].socketId === winner.socketId ? 'player1' : 'player2';
+
+      // Check if game record already exists
+      let gameRecord = await Game.findOne({ roomCode });
+
+      // Convert score array to object if needed
+      const scoreObject = game.score ? { player1: game.score[0], player2: game.score[1] } : { player1: 0, player2: 0 };
+
+      if (gameRecord) {
+        // Update existing game (staked or casual)
+        if (gameRecord.isStaked) {
+          console.log(`💎 Staked match ended. Updating game record with winner...`);
+        } else {
+          console.log(`🎮 Casual match ended. Updating game record with winner...`);
+        }
+
+        gameRecord.winner = winnerRole;
+        gameRecord.score = scoreObject;
+        gameRecord.status = 'finished';
+        gameRecord.endedAt = new Date();
+        gameRecord.winnerAddress = winnerRole === 'player1' ? gameRecord.player1Address : gameRecord.player2Address;
+
+        // Generate signature if staked and not already generated
+        if (gameRecord.isStaked && gameRecord.winnerAddress && !gameRecord.winnerSignature) {
+          if (signatureService.isReady()) {
+            try {
+              const signature = await signatureService.signWinner(
+                roomCode,
+                gameRecord.winnerAddress,
+                gameRecord.stakeAmount
+              );
+              gameRecord.winnerSignature = signature;
+              console.log(`✅ Winner signature generated for room: ${roomCode}`);
+              console.log(`🔐 Winner signature:`, signature.slice(0, 20) + '...');
+            } catch (error) {
+              console.error('❌ Failed to generate signature:', error);
+            }
+          } else {
+            console.warn('⚠️  Signature service not ready, skipping signature generation');
+          }
+        }
+
+        await gameRecord.save();
+        console.log(`✅ Game ${roomCode} updated with winner: ${winnerRole}`);
+      } else {
+        // No existing record - create new casual game
+        console.log(`🎮 Creating casual game record for room: ${roomCode}`);
+
+        gameRecord = new Game({
+          roomCode,
+          player1: {
+            name: game.players[0].name,
+            rating: ratingResult ? ratingResult.winner.oldRating : 1000
+          },
+          player2: {
+            name: game.players[1].name,
+            rating: ratingResult ? ratingResult.loser.oldRating : 1000
+          },
+          winner: winnerRole,
+          score: scoreObject,
+          isStaked: false,
+          status: 'finished',
+          endedAt: new Date()
+        });
+
+        await gameRecord.save();
+        console.log(`✅ Casual game ${roomCode} saved to database`);
+      }
+    } catch (error) {
+      console.error('Error saving game record:', error);
+      // Continue with normal game end flow even if save fails
+    }
 
     const gameOverData = {
       winner: winner.socketId,

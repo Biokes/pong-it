@@ -4,6 +4,9 @@ import Welcome from './components/Welcome';
 import MultiplayerGame from './components/MultiplayerGame';
 import SpectatorView from './components/SpectatorView';
 import GameOver from './components/GameOver';
+import MyWins from './components/MyWins';
+import GameHistory from './components/GameHistory';
+import { Web3Provider } from './components/Web3Provider';
 import './styles/App.css';
 import { STORAGE_KEY } from './constants';
 
@@ -31,51 +34,61 @@ function App() {
   };
 
   return (
-    <Router>
-      <div className="App">
-        <Routes>
-          <Route 
-            path="/" 
-            element={
-              <Welcome 
-                setGameState={setGameState} 
-                savedUsername={username}
-                onUsernameSet={handleUsernameSet}
-              />
-            } 
-          />
-          <Route
-            path="/game"
-            element={
-              <MultiplayerGame
-                username={username}
-              />
-            }
-          />
-          <Route
-            path="/spectate"
-            element={<SpectatorView />}
-          />
-          <Route
-            path="/game-over" 
-            element={
-              <GameOver 
-                savedUsername={username}
-                onPlayAgain={() => {
-                  setGameState(prev => ({
-                    ...prev,
-                    player1: {
-                      name: username,
-                      rating: 800
-                    }
-                  }));
-                }}
-              />
-            } 
-          />
-        </Routes>
-      </div>
-    </Router>
+    <Web3Provider>
+      <Router>
+        <div className="App">
+          <Routes>
+            <Route
+              path="/"
+              element={
+                <Welcome
+                  setGameState={setGameState}
+                  savedUsername={username}
+                  onUsernameSet={handleUsernameSet}
+                />
+              }
+            />
+            <Route
+              path="/game"
+              element={
+                <MultiplayerGame
+                  username={username}
+                />
+              }
+            />
+            <Route
+              path="/spectate"
+              element={<SpectatorView />}
+            />
+            <Route
+              path="/game-over"
+              element={
+                <GameOver
+                  savedUsername={username}
+                  onPlayAgain={() => {
+                    setGameState(prev => ({
+                      ...prev,
+                      player1: {
+                        name: username,
+                        rating: 800
+                      }
+                    }));
+                  }}
+                />
+              }
+            />
+            <Route
+              path="/my-wins"
+              element={<MyWins />}
+            />
+            <Route
+              path="/game-history"
+              element={<GameHistory savedUsername={username} />}
+            />
+          </Routes>
+        </div>
+      </Router>
+    </Web3Provider>
   );
 }
 
